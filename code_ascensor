@@ -1,0 +1,510 @@
+// ============================================
+// CONTROL DE ASCENSOR - VERSION SIMPLIFICADA
+// ============================================
+
+// PINES DE ENTRADA - SENSORES DE PISO
+#define S1 13
+#define S2 12
+#define S3 14
+#define S4 27
+
+// PINES DE ENTRADA - PULSADORES
+#define B1 26
+#define B2 25
+#define B3 33
+#define B4 32
+
+#define CONTINUE_BTN 36
+#define DOOR_SENSOR 39
+
+// MOTOR
+#define MOTOR_UP 19
+#define MOTOR_DOWN 18
+
+// DISPLAY
+#define DS_PIN 21
+#define SH_PIN 22
+#define ST_PIN 23
+
+// CONSTANTES
+#define INIT_SEARCH_TIME 10000
+#define SENSOR_CHECK_INTERVAL 50
+
+// ESTADOS
+enum SystemState {
+  STATE_INITIAL_SEARCH,
+  STATE_REPOSE,
+  STATE_MOVING,
+  STATE_WAITING_CONTINUE
+};
+
+// VARIABLES
+SystemState currentState = STATE_INITIAL_SEARCH;
+
+int currentFloor = 0;
+int targetFloor = 0;
+
+bool directionUp = true;
+bool doorsClosed = true;
+
+unsigned long searchStartTime = 0;
+unsigned long lastSensorCheck = 0;
+
+// COLA
+#define MAX_REQUESTS 8
+int requestQueue[MAX_REQUESTS];
+int requestCount = 0;
+
+// DISPLAY
+byte digitPatterns[5] = {
+  0b11111100,
+  0b01100000,
+  0b11011010,
+  0b11110010,
+  0b01100110
+};
+
+// ============================================
+// FUNCION MILLIS SEGURA
+// ============================================
+
+bool timeHasPassed(unsigned long lastTime, unsigned long interval) {
+  return ((unsigned long)(millis() - lastTime) > interval);
+}
+
+// ============================================
+// SETUP
+// ============================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(S1, INPUT);
+  pinMode(S2, INPUT);
+  pinMode(S3, INPUT);
+  pinMode(S4, INPUT);
+
+  pinMode(B1, INPUT);
+  pinMode(B2, INPUT);
+  pinMode(B3, INPUT);
+  pinMode(B4, INPUT);
+
+  pinMode(CONTINUE_BTN, INPUT);
+  pinMode(DOOR_SENSOR, INPUT);
+
+  pinMode(MOTOR_UP, OUTPUT);
+  pinMode(MOTOR_DOWN, OUTPUT);
+
+  pinMode(DS_PIN, OUTPUT);
+  pinMode(SH_PIN, OUTPUT);
+  pinMode(ST_PIN, OUTPUT);
+
+  stopMotor();
+
+  updateDisplay(0);
+
+  for (int i = 0; i < MAX_REQUESTS; i++) {
+    requestQueue[i] = 0;
+  }
+
+  bool sensorActive = checkAnySensorActive();
+  doorsClosed = (digitalRead(DOOR_SENSOR) == HIGH);
+
+  if (sensorActive) {
+    determineCurrentFloor();
+    currentState = STATE_REPOSE;
+    updateDisplay(currentFloor);
+  }
+  else {
+    startInitialSearch();
+  }
+}
+
+// ============================================
+// LOOP
+// ============================================
+
+void loop() {
+
+  doorsClosed = (digitalRead(DOOR_SENSOR) == HIGH);
+
+  switch (currentState) {
+
+    case STATE_INITIAL_SEARCH:
+      handleInitialSearch();
+      break;
+
+    case STATE_REPOSE:
+      handleRepose();
+      break;
+
+    case STATE_MOVING:
+      handleMoving();
+      break;
+
+    case STATE_WAITING_CONTINUE:
+      handleWaitingContinue();
+      break;
+  }
+
+  readFloorButtons();
+}
+
+// ============================================
+// SENSORES
+// ============================================
+
+bool checkAnySensorActive() {
+
+  return (
+    digitalRead(S1) ||
+    digitalRead(S2) ||
+    digitalRead(S3) ||
+    digitalRead(S4)
+  );
+}
+
+void determineCurrentFloor() {
+
+  if (digitalRead(S1)) currentFloor = 1;
+  else if (digitalRead(S2)) currentFloor = 2;
+  else if (digitalRead(S3)) currentFloor = 3;
+  else if (digitalRead(S4)) currentFloor = 4;
+}
+
+int readSensor() {
+
+  if (digitalRead(S1)) return 1;
+  if (digitalRead(S2)) return 2;
+  if (digitalRead(S3)) return 3;
+  if (digitalRead(S4)) return 4;
+
+  return 0;
+}
+
+// ============================================
+// BUSQUEDA INICIAL
+// ============================================
+
+void startInitialSearch() {
+
+  digitalWrite(MOTOR_UP, LOW);
+  digitalWrite(MOTOR_DOWN, HIGH);
+
+  currentState = STATE_INITIAL_SEARCH;
+  searchStartTime = millis();
+
+  updateDisplay(0);
+}
+
+void handleInitialSearch() {
+
+  int detectedFloor = readSensor();
+
+  if (detectedFloor > 0) {
+
+    stopMotor();
+
+    currentFloor = detectedFloor;
+
+    updateDisplay(currentFloor);
+
+    currentState = STATE_REPOSE;
+
+    return;
+  }
+
+  if (timeHasPassed(searchStartTime, INIT_SEARCH_TIME)) {
+
+    stopMotor();
+
+    displayError();
+
+    currentState = STATE_REPOSE;
+  }
+}
+
+// ============================================
+// REPOSO
+// ============================================
+
+void handleRepose() {
+
+  updateDisplay(currentFloor);
+
+  if (requestCount > 0) {
+
+    int nextFloor = getNextFloorInDirection();
+
+    if (nextFloor > 0 && checkMovementConditions()) {
+
+      targetFloor = nextFloor;
+
+      directionUp = (targetFloor > currentFloor);
+
+      currentState = STATE_MOVING;
+
+      startMotor();
+    }
+  }
+}
+
+// ============================================
+// MOVIMIENTO
+// ============================================
+
+void handleMoving() {
+
+  if (!doorsClosed) {
+
+    stopMotor();
+
+    currentState = STATE_REPOSE;
+
+    return;
+  }
+
+  if (timeHasPassed(lastSensorCheck, SENSOR_CHECK_INTERVAL)) {
+
+    lastSensorCheck = millis();
+
+    int detectedFloor = readSensor();
+
+    if (detectedFloor > 0) {
+
+      currentFloor = detectedFloor;
+
+      updateDisplay(currentFloor);
+
+      if (detectedFloor == targetFloor) {
+
+        stopMotor();
+
+        removeFromQueue(targetFloor);
+
+        if (requestCount > 0)
+          currentState = STATE_WAITING_CONTINUE;
+        else
+          currentState = STATE_REPOSE;
+
+        return;
+      }
+
+      for (int i = 0; i < requestCount; i++) {
+
+        if (requestQueue[i] == detectedFloor) {
+
+          stopMotor();
+
+          removeFromQueue(detectedFloor);
+
+          currentState = STATE_WAITING_CONTINUE;
+
+          return;
+        }
+      }
+    }
+  }
+}
+
+// ============================================
+// CONTINUAR
+// ============================================
+
+void handleWaitingContinue() {
+
+  if (doorsClosed && digitalRead(CONTINUE_BTN)) {
+
+    delay(100);
+
+    if (requestCount > 0) {
+
+      int nextFloor = getNextFloorInDirection();
+
+      if (nextFloor > 0) {
+
+        targetFloor = nextFloor;
+
+        directionUp = (targetFloor > currentFloor);
+
+        currentState = STATE_MOVING;
+
+        startMotor();
+      }
+    }
+    else {
+
+      currentState = STATE_REPOSE;
+      targetFloor = 0;
+    }
+  }
+}
+
+// ============================================
+// MOTOR
+// ============================================
+
+void startMotor() {
+
+  stopMotor();
+
+  delay(100);
+
+  if (directionUp) {
+
+    digitalWrite(MOTOR_UP, HIGH);
+    digitalWrite(MOTOR_DOWN, LOW);
+  }
+  else {
+
+    digitalWrite(MOTOR_UP, LOW);
+    digitalWrite(MOTOR_DOWN, HIGH);
+  }
+}
+
+void stopMotor() {
+
+  digitalWrite(MOTOR_UP, LOW);
+  digitalWrite(MOTOR_DOWN, LOW);
+}
+
+bool checkMovementConditions() {
+
+  if (!doorsClosed) return false;
+
+  if (readSensor() != currentFloor) return false;
+
+  return true;
+}
+
+// ============================================
+// BOTONES
+// ============================================
+
+void readFloorButtons() {
+
+  static unsigned long lastButtonTime = 0;
+
+  if (timeHasPassed(lastButtonTime, 100)) {
+
+    lastButtonTime = millis();
+
+    if (digitalRead(B1)) addToQueue(1);
+    if (digitalRead(B2)) addToQueue(2);
+    if (digitalRead(B3)) addToQueue(3);
+    if (digitalRead(B4)) addToQueue(4);
+  }
+}
+
+// ============================================
+// COLA
+// ============================================
+
+void addToQueue(int floor) {
+
+  for (int i = 0; i < requestCount; i++)
+    if (requestQueue[i] == floor) return;
+
+  if (floor == currentFloor && currentState == STATE_REPOSE) return;
+
+  if (requestCount < MAX_REQUESTS) {
+
+    requestQueue[requestCount] = floor;
+    requestCount++;
+  }
+}
+
+void removeFromQueue(int floor) {
+
+  for (int i = 0; i < requestCount; i++) {
+
+    if (requestQueue[i] == floor) {
+
+      for (int j = i; j < requestCount - 1; j++)
+        requestQueue[j] = requestQueue[j + 1];
+
+      requestCount--;
+
+      return;
+    }
+  }
+}
+
+int getNextFloorInDirection() {
+
+  int bestFloor = 0;
+
+  for (int i = 0; i < requestCount; i++) {
+
+    int floor = requestQueue[i];
+
+    if (directionUp) {
+
+      if (floor > currentFloor) {
+
+        if (bestFloor == 0 || floor < bestFloor)
+          bestFloor = floor;
+      }
+    }
+    else {
+
+      if (floor < currentFloor) {
+
+        if (bestFloor == 0 || floor > bestFloor)
+          bestFloor = floor;
+      }
+    }
+  }
+
+  if (bestFloor == 0) {
+
+    directionUp = !directionUp;
+
+    for (int i = 0; i < requestCount; i++) {
+
+      int floor = requestQueue[i];
+
+      if (directionUp) {
+
+        if (floor > currentFloor)
+          if (bestFloor == 0 || floor < bestFloor)
+            bestFloor = floor;
+      }
+      else {
+
+        if (floor < currentFloor)
+          if (bestFloor == 0 || floor > bestFloor)
+            bestFloor = floor;
+      }
+    }
+  }
+
+  return bestFloor;
+}
+
+// ============================================
+// DISPLAY
+// ============================================
+
+void updateDisplay(int number) {
+
+  if (number < 0 || number > 4) number = 0;
+
+  byte pattern = digitPatterns[number];
+
+  digitalWrite(ST_PIN, LOW);
+
+  shiftOut(DS_PIN, SH_PIN, LSBFIRST, pattern);
+
+  digitalWrite(ST_PIN, HIGH);
+}
+
+void displayError() {
+
+  byte errorPattern = 0b10011110;
+
+  digitalWrite(ST_PIN, LOW);
+  shiftOut(DS_PIN, SH_PIN, LSBFIRST, errorPattern);
+  digitalWrite(ST_PIN, HIGH);
+}
